@@ -497,7 +497,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // ── Main ────────────────────────────────────────────────────────────────
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 let delegate = AppDelegate()
 app.delegate = delegate
+
+// App menu with Cmd+Q
+let mainMenu = NSMenu()
+let appMenuItem = NSMenuItem()
+mainMenu.addItem(appMenuItem)
+let appMenu = NSMenu()
+appMenu.addItem(NSMenuItem(title: "About Claude Usage", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
+appMenu.addItem(NSMenuItem.separator())
+appMenu.addItem(NSMenuItem(title: "Quit Claude Usage", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+appMenuItem.submenu = appMenu
+app.mainMenu = mainMenu
+
 app.run()
