@@ -108,6 +108,23 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 }
 
+// ── Draggable WKWebView ─────────────────────────────────────────────────
+class DraggableWebView: WKWebView {
+    private var dragOrigin: NSPoint?
+    override func mouseDown(with event: NSEvent) {
+        dragOrigin = event.locationInWindow
+        super.mouseDown(with: event)
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let origin = dragOrigin, let win = window else { return }
+        let current = event.locationInWindow
+        var frame = win.frame
+        frame.origin.x += current.x - origin.x
+        frame.origin.y += current.y - origin.y
+        win.setFrameOrigin(frame.origin)
+    }
+}
+
 // ── Script Message Handler (prevent WKUserContentController retain cycle)
 class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
     weak var delegate: AppDelegate?
@@ -229,7 +246,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }).observe(document.body)
             """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(resizeScript)
-        widgetWebView = WKWebView(frame: widgetWindow.contentView!.bounds, configuration: config)
+        widgetWebView = DraggableWebView(frame: widgetWindow.contentView!.bounds, configuration: config)
         widgetWebView.autoresizingMask = [.width, .height]
         widgetWebView.setValue(false, forKey: "drawsBackground")
         widgetWindow.contentView?.addSubview(widgetWebView)
