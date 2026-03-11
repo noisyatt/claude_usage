@@ -139,6 +139,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var ccusageData = CcusageData()
     private var isLoggedIn = false
     private var statusItem: NSStatusItem!
+    private var pendingHTMLUpdate: DispatchWorkItem?
+    private var lastWidgetHeight: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         navigator = PageNavigator()
@@ -167,7 +169,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showWidget() { widgetWindow.orderFront(nil) }
     @objc func hideWidget() { widgetWindow.orderOut(nil) }
     @objc func refreshNow() { fetchAll() }
-    private var lastWidgetHeight: CGFloat = 0
     func resizeWidget(height: CGFloat) {
         guard let screen = NSScreen.main else { return }
         let sf = screen.visibleFrame
@@ -221,6 +222,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         config.websiteDataStore = .nonPersistent()
         scriptMessageHandler = WeakScriptMessageHandler(delegate: self)
         config.userContentController.add(scriptMessageHandler!, name: "widget")
+        // Inject resize reporter as user script (avoids race with loadHTMLString)
+        let resizeScript = WKUserScript(source: """
+            new ResizeObserver(function(){
+                webkit.messageHandlers.widget.postMessage(document.body.scrollHeight)
+            }).observe(document.body)
+            """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        config.userContentController.addUserScript(resizeScript)
         widgetWebView = WKWebView(frame: widgetWindow.contentView!.bounds, configuration: config)
         widgetWebView.autoresizingMask = [.width, .height]
         widgetWebView.setValue(false, forKey: "drawsBackground")
@@ -264,11 +272,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func closeLoginWindow() {
         navigator.cleanupPopups()
         navigator.webView.removeFromSuperview()
-        loginWindow?.orderOut(nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.loginWindow?.close()
-            self?.loginWindow = nil
-        }
+        loginWindow?.close()
+        loginWindow = nil
     }
 
     private func startLoginPoll() {
@@ -414,6 +419,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // ── Widget HTML ─────────────────────────────────────────────────────
     func updateWidgetHTML() {
+        pendingHTMLUpdate?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingHTMLUpdate = nil
+            self.renderWidgetHTML()
+        }
+        pendingHTMLUpdate = work
+        DispatchQueue.main.async(execute: work)
+    }
+
+    private func renderWidgetHTML() {
         let t = dateStr("HH:mm")
         let mx = max(ccusageData.dailyEntries.map{$0.cost}.max() ?? 0.01, 0.01)
         var bars = ""
@@ -488,9 +504,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         <button class='btn btn-ref' onclick="webkit.messageHandlers.widget.postMessage('refresh')">↻ Refresh</button>
         <button class='btn btn-auth \(isLoggedIn ? "" : "login")' onclick="webkit.messageHandlers.widget.postMessage('\(isLoggedIn ? "logout" : "login")')">\(isLoggedIn ? "Logout" : "Login")</button>
         </div>
-        <script>window.onload=()=>{webkit.messageHandlers.widget.postMessage(document.body.scrollHeight)}</script>
         </body></html>
         """
+        // Re-register handler to avoid stale JS context references
+        let ucc = widgetWebView.configuration.userContentController
+        ucc.removeScriptMessageHandler(forName: "widget")
+        ucc.add(scriptMessageHandler!, name: "widget")
         widgetWebView.loadHTMLString(html, baseURL: nil)
     }
 }
