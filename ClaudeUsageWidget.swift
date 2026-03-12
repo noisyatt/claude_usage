@@ -165,6 +165,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusBar()
         setupWidgetWindow()
         fetchAll()
+        // Auto-login: if still not logged in after 30s, trigger login automatically
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self = self, !self.isLoggedIn else { return }
+            self.openLoginWindow()
+        }
     }
 
     // ── Status Bar ──────────────────────────────────────────────────────
@@ -338,9 +343,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let npx = self.findExecutable("npx") ?? "/opt/homebrew/bin/npx"
             let daily = self.sh(npx, ["--yes", "ccusage", "daily", "--since", weekAgo, "--json", "--breakdown"])
             let monthly = self.sh(npx, ["--yes", "ccusage", "monthly", "--since", monthStart, "--json", "--breakdown"])
-            self.parseCcusageDaily(daily, today: today)
-            self.parseCcusageMonthly(monthly)
-            DispatchQueue.main.async { self.updateWidgetHTML() }
+            // Parse and update state on main thread to avoid data races
+            DispatchQueue.main.async {
+                self.parseCcusageDaily(daily, today: today)
+                self.parseCcusageMonthly(monthly)
+                self.updateWidgetHTML()
+            }
         }
     }
 
@@ -403,7 +411,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
         p.environment = env
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-        try? p.run(); p.waitUntilExit()
+        do { try p.run() } catch { return "" }
+        p.waitUntilExit()
         return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
     private func findExecutable(_ name: String) -> String? {
@@ -434,12 +443,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func bc(_ p: Double) -> String { p >= 90 ? "#ef4444" : p >= 70 ? "#f59e0b" : "#a78bfa" }
     private func pc(_ p: Double) -> String { p >= 90 ? "#fca5a5" : p >= 70 ? "#fcd34d" : "#e4e4e7" }
 
+    // ── Export JSON for external apps ────────────────────────────────────
+    private func exportJSON() {
+        let data: [String: Any] = [
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "isLoggedIn": isLoggedIn,
+            "rateLimit": [
+                "fiveHourPct": usageData.fiveHourPct,
+                "fiveHourReset": usageData.fiveHourReset,
+                "sevenDayPct": usageData.sevenDayPct,
+                "sevenDayReset": usageData.sevenDayReset,
+                "sevenDaySonnetPct": usageData.sevenDaySonnetPct,
+                "sevenDaySonnetReset": usageData.sevenDaySonnetReset,
+                "hasSonnet": usageData.hasSonnet,
+            ],
+            "today": [
+                "cost": ccusageData.todayCost,
+                "tokens": ccusageData.todayTokens,
+                "models": ccusageData.todayModels.map { ["name": $0.name, "cost": $0.cost] as [String: Any] },
+            ],
+            "month": [
+                "cost": ccusageData.monthCost,
+                "tokens": ccusageData.monthTokens,
+                "input": ccusageData.monthInput,
+                "output": ccusageData.monthOutput,
+                "cacheWrite": ccusageData.monthCacheWrite,
+                "cacheRead": ccusageData.monthCacheRead,
+                "models": ccusageData.monthModels.map { ["name": $0.name, "cost": $0.cost] as [String: Any] },
+            ],
+            "daily": ccusageData.dailyEntries.map { ["day": $0.day, "cost": $0.cost] as [String: Any] },
+        ]
+        if let json = try? JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys]) {
+            try? json.write(to: URL(fileURLWithPath: "/tmp/claude-usage.json"), options: .atomic)
+        }
+    }
+
     // ── Widget HTML ─────────────────────────────────────────────────────
     func updateWidgetHTML() {
         pendingHTMLUpdate?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.pendingHTMLUpdate = nil
+            self.exportJSON()
             self.renderWidgetHTML()
         }
         pendingHTMLUpdate = work
