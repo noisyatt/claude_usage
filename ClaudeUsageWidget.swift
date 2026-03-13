@@ -50,7 +50,8 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     func navigate(to url: String, completion: @escaping (String) -> Void) {
         onContent = completion
         retryCount = 0
-        webView.load(URLRequest(url: URL(string: url)!))
+        guard let parsed = URL(string: url) else { return }
+        webView.load(URLRequest(url: parsed))
     }
 
     func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
@@ -66,8 +67,8 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
                     if self.retryCount < 5 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { wv.reload() }
                     } else { self.onContent?("") }
-                } else if wv.url?.absoluteString != USAGE_URL {
-                    wv.load(URLRequest(url: URL(string: USAGE_URL)!))
+                } else if wv.url?.absoluteString != USAGE_URL, let usageURL = URL(string: USAGE_URL) {
+                    wv.load(URLRequest(url: usageURL))
                 } else {
                     self.onContent?("")
                 }
@@ -81,7 +82,7 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 650),
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         win.title = "Login"; win.center()
-        let popup = WKWebView(frame: win.contentView!.bounds, configuration: configuration)
+        let popup = WKWebView(frame: win.contentView?.bounds ?? .zero, configuration: configuration)
         popup.autoresizingMask = [.width, .height]
         popup.uiDelegate = self
         popup.customUserAgent = wv.customUserAgent
@@ -207,10 +208,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         stopRefreshTimer()
         isLoggedIn = false; usageData = UsageData()
         updateWidgetHTML()
-        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
-            self.navigator = PageNavigator()
-            self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
-            self.openLoginWindow()
+        WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.navigator = PageNavigator()
+                self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
+                self.openLoginWindow()
+            }
         }
     }
     @objc func quitApp() { NSApp.terminate(nil) }
@@ -251,7 +255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }).observe(document.body)
             """, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(resizeScript)
-        widgetWebView = DraggableWebView(frame: widgetWindow.contentView!.bounds, configuration: config)
+        widgetWebView = DraggableWebView(frame: widgetWindow.contentView?.bounds ?? .zero, configuration: config)
         widgetWebView.autoresizingMask = [.width, .height]
         widgetWebView.setValue(false, forKey: "drawsBackground")
         widgetWindow.contentView?.addSubview(widgetWebView)
@@ -281,10 +285,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
             styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         win.title = "Claude Login"; win.center()
-        navigator.webView.frame = win.contentView!.bounds
+        navigator.webView.frame = win.contentView?.bounds ?? .zero
         navigator.webView.autoresizingMask = [.width, .height]
         win.contentView?.addSubview(navigator.webView)
-        navigator.webView.load(URLRequest(url: URL(string: "\(CLAUDE_URL)/login")!))
+        if let loginURL = URL(string: "\(CLAUDE_URL)/login") {
+            navigator.webView.load(URLRequest(url: loginURL))
+        }
         loginWindow = win
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -312,7 +318,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             probing = true
-            probe.load(URLRequest(url: URL(string: USAGE_URL)!))
+            guard let usageURL = URL(string: USAGE_URL) else { probing = false; return }
+            probe.load(URLRequest(url: usageURL))
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 probe.evaluateJavaScript("document.body.innerText") { result, _ in
                     probing = false
@@ -320,6 +327,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard text.contains("utilization") else { return }
                     self.loginPollTimer?.invalidate()
                     self.closeLoginWindow()
+                    // Detach old navigator callbacks before replacing
+                    self.navigator.onContent = nil
+                    self.navigator.onLoginNeeded = nil
                     // Fresh navigator for post-login fetches
                     self.navigator = PageNavigator()
                     self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
