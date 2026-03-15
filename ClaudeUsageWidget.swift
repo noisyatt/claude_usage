@@ -55,8 +55,10 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            wv.evaluateJavaScript("document.body.innerText") { result, _ in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self else { return }
+            wv.evaluateJavaScript("document.body.innerText") { [weak self] result, _ in
+                guard let self = self else { return }
                 let text = result as? String ?? ""
                 if text.contains("utilization") {
                     self.onContent?(text)
@@ -94,7 +96,8 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewDidClose(_ webView: WKWebView) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
             if let idx = self.popupWebViews.firstIndex(where: { $0 === webView }) {
                 self.popupWindows[idx].window?.orderOut(nil)
                 self.popupWebViews.remove(at: idx)
@@ -206,7 +209,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func logout() {
         stopRefreshTimer()
+        loginPollTimer?.invalidate(); loginPollTimer = nil
+        closeLoginWindow()
         isLoggedIn = false; usageData = UsageData()
+        // Detach old navigator callbacks before replacing
+        navigator.onContent = nil
+        navigator.onLoginNeeded = nil
         updateWidgetHTML()
         WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             DispatchQueue.main.async {
@@ -312,20 +320,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         probe.customUserAgent = USER_AGENT
 
         var probing = false
-        loginPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        loginPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
             guard let self = self, self.loginWindow != nil, !probing else {
-                if self?.loginWindow == nil { self?.loginPollTimer?.invalidate() }
+                if self?.loginWindow == nil { timer.invalidate() }
                 return
             }
             probing = true
             guard let usageURL = URL(string: USAGE_URL) else { probing = false; return }
             probe.load(URLRequest(url: usageURL))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                probe.evaluateJavaScript("document.body.innerText") { result, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard let self = self else { probing = false; return }
+                probe.evaluateJavaScript("document.body.innerText") { [weak self] result, _ in
                     probing = false
+                    guard let self = self else { return }
                     let text = result as? String ?? ""
                     guard text.contains("utilization") else { return }
                     self.loginPollTimer?.invalidate()
+                    self.loginPollTimer = nil
                     self.closeLoginWindow()
                     // Detach old navigator callbacks before replacing
                     self.navigator.onContent = nil
@@ -578,10 +589,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         </div>
         </body></html>
         """
-        // Re-register handler to avoid stale JS context references
-        let ucc = widgetWebView.configuration.userContentController
-        ucc.removeScriptMessageHandler(forName: "widget")
-        ucc.add(scriptMessageHandler!, name: "widget")
         widgetWebView.loadHTMLString(html, baseURL: nil)
     }
 }
