@@ -108,13 +108,15 @@ claude-usage-widget &
 
 ## Configuration
 
-환경변수로 ORG_ID를 설정할 수 있습니다 (팀원별 다른 조직):
+앱은 로그인 시 `https://claude.ai/api/organizations`를 통해 자동으로 현재 사용자의 Organization ID(ORG_ID)를 가져옵니다.
+
+필요한 경우 환경변수로 ORG_ID를 강제 지정(override)할 수 있습니다:
 
 ```bash
 export CLAUDE_ORG_ID="your-org-id-here"
 ```
 
-ORG_ID 확인 방법: claude.ai에서 DevTools → Network 탭 → `usage` 요청 URL에서 확인
+ORG_ID 확인 방법: claude.ai에서 DevTools → Network 탭 → `organizations` 또는 `usage` 요청 URL에서 확인
 
 ## Build Targets
 

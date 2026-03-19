@@ -2,8 +2,10 @@ import Cocoa
 import WebKit
 
 // ── Config ──────────────────────────────────────────────────────────────
-let ORG_ID = ProcessInfo.processInfo.environment["CLAUDE_ORG_ID"] ?? "d93fb657-add2-414d-9493-a50dea6180b4"
-let USAGE_URL = "https://claude.ai/api/organizations/\(ORG_ID)/usage"
+var ORG_ID = ProcessInfo.processInfo.environment["CLAUDE_ORG_ID"] ?? ""
+var USAGE_URL: String {
+    return ORG_ID.isEmpty ? "" : "https://claude.ai/api/organizations/\(ORG_ID)/usage"
+}
 let CLAUDE_URL = "https://claude.ai"
 let REFRESH_INTERVAL: TimeInterval = 60
 let WIDGET_WIDTH: CGFloat = 340
@@ -36,6 +38,7 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     private var retryCount = 0
     private var popupWebViews: [WKWebView] = []
     private var popupWindows: [NSWindowController] = []
+    private var targetURL: String = ""
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -48,6 +51,7 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func navigate(to url: String, completion: @escaping (String) -> Void) {
+        targetURL = url
         onContent = completion
         retryCount = 0
         guard let parsed = URL(string: url) else { return }
@@ -60,7 +64,7 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
             wv.evaluateJavaScript("document.body.innerText") { [weak self] result, _ in
                 guard let self = self else { return }
                 let text = result as? String ?? ""
-                if text.contains("utilization") {
+                if text.contains("utilization") || (wv.url?.absoluteString.contains("/api/organizations") == true && text.contains("uuid")) {
                     self.onContent?(text)
                 } else if text.contains("permission_error") || text.contains("session_invalid") || wv.url?.absoluteString.contains("/login") == true {
                     self.onLoginNeeded?()
@@ -69,8 +73,8 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
                     if self.retryCount < 5 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { wv.reload() }
                     } else { self.onContent?("") }
-                } else if wv.url?.absoluteString != USAGE_URL, let usageURL = URL(string: USAGE_URL) {
-                    wv.load(URLRequest(url: usageURL))
+                } else if !self.targetURL.isEmpty, wv.url?.absoluteString != self.targetURL, let target = URL(string: self.targetURL) {
+                    wv.load(URLRequest(url: target))
                 } else {
                     self.onContent?("")
                 }
@@ -84,6 +88,7 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 650),
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         win.title = "Login"; win.center()
+        win.isReleasedWhenClosed = false
         let popup = WKWebView(frame: win.contentView?.bounds ?? .zero, configuration: configuration)
         popup.autoresizingMask = [.width, .height]
         popup.uiDelegate = self
@@ -99,9 +104,11 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             if let idx = self.popupWebViews.firstIndex(where: { $0 === webView }) {
-                self.popupWindows[idx].window?.orderOut(nil)
+                if idx < self.popupWindows.count {
+                    self.popupWindows[idx].window?.orderOut(nil)
+                    self.popupWindows.remove(at: idx)
+                }
                 self.popupWebViews.remove(at: idx)
-                self.popupWindows.remove(at: idx)
             }
         }
     }
@@ -278,12 +285,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func fetchUsage() {
-        navigator.navigate(to: USAGE_URL) { [weak self] text in
-            guard let self = self, !text.isEmpty else { return }
-            self.isLoggedIn = true
-            self.parseUsageJSON(text)
-            self.updateWidgetHTML()
-            self.startRefreshTimer()
+        if ORG_ID.isEmpty {
+            navigator.navigate(to: "\(CLAUDE_URL)/api/organizations") { [weak self] text in
+                guard let self = self, !text.isEmpty else { return }
+                if let d = text.data(using: .utf8),
+                   let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]],
+                   let first = arr.first,
+                   let uuid = first["uuid"] as? String {
+                    ORG_ID = uuid
+                    self.fetchUsage()
+                } else {
+                    self.isLoggedIn = false
+                    self.updateWidgetHTML()
+                }
+            }
+        } else {
+            navigator.navigate(to: USAGE_URL) { [weak self] text in
+                guard let self = self, !text.isEmpty else { return }
+                self.isLoggedIn = true
+                self.parseUsageJSON(text)
+                self.updateWidgetHTML()
+                self.startRefreshTimer()
+            }
         }
     }
 
@@ -293,6 +316,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
             styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         win.title = "Claude Login"; win.center()
+        win.isReleasedWhenClosed = false
         navigator.webView.frame = win.contentView?.bounds ?? .zero
         navigator.webView.autoresizingMask = [.width, .height]
         win.contentView?.addSubview(navigator.webView)
@@ -326,29 +350,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             probing = true
-            guard let usageURL = URL(string: USAGE_URL) else { probing = false; return }
-            probe.load(URLRequest(url: usageURL))
+            let probeURL = ORG_ID.isEmpty ? "\(CLAUDE_URL)/api/organizations" : USAGE_URL
+            guard let url = URL(string: probeURL) else { probing = false; return }
+            probe.load(URLRequest(url: url))
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self = self else { probing = false; return }
                 probe.evaluateJavaScript("document.body.innerText") { [weak self] result, _ in
                     probing = false
                     guard let self = self else { return }
                     let text = result as? String ?? ""
-                    guard text.contains("utilization") else { return }
-                    self.loginPollTimer?.invalidate()
-                    self.loginPollTimer = nil
-                    self.closeLoginWindow()
-                    // Detach old navigator callbacks before replacing
-                    self.navigator.onContent = nil
-                    self.navigator.onLoginNeeded = nil
-                    // Fresh navigator for post-login fetches
-                    self.navigator = PageNavigator()
-                    self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
-                    self.isLoggedIn = true
-                    self.parseUsageJSON(text)
-                    self.updateWidgetHTML()
-                    self.startRefreshTimer()
-                    self.fetchCcusage()
+                    
+                    if ORG_ID.isEmpty {
+                        if text.contains("uuid") {
+                            self.loginPollTimer?.invalidate()
+                            self.loginPollTimer = nil
+                            self.closeLoginWindow()
+                            self.navigator.onContent = nil
+                            self.navigator.onLoginNeeded = nil
+                            self.navigator = PageNavigator()
+                            self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
+                            self.fetchAll()
+                        }
+                    } else {
+                        guard text.contains("utilization") else { return }
+                        self.loginPollTimer?.invalidate()
+                        self.loginPollTimer = nil
+                        self.closeLoginWindow()
+                        self.navigator.onContent = nil
+                        self.navigator.onLoginNeeded = nil
+                        self.navigator = PageNavigator()
+                        self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
+                        self.isLoggedIn = true
+                        self.parseUsageJSON(text)
+                        self.updateWidgetHTML()
+                        self.startRefreshTimer()
+                        self.fetchCcusage()
+                    }
                 }
             }
         }
