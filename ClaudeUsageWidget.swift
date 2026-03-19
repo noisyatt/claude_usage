@@ -114,8 +114,21 @@ class PageNavigator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func cleanupPopups() {
+        for popup in popupWebViews {
+            popup.stopLoading()
+            popup.uiDelegate = nil
+        }
         for wc in popupWindows { wc.window?.orderOut(nil) }
         popupWebViews.removeAll(); popupWindows.removeAll()
+    }
+
+    func destroy() {
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        onContent = nil
+        onLoginNeeded = nil
+        cleanupPopups()
     }
 }
 
@@ -169,6 +182,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var pendingHTMLUpdate: DispatchWorkItem?
     private var lastWidgetHeight: CGFloat = 0
+    private var isLoggingOut = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         navigator = PageNavigator()
@@ -215,17 +229,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         widgetWindow.setFrame(frame, display: true, animate: false)
     }
     @objc func logout() {
+        guard !isLoggingOut else { return }
+        isLoggingOut = true
         stopRefreshTimer()
         loginPollTimer?.invalidate(); loginPollTimer = nil
         closeLoginWindow()
         isLoggedIn = false; usageData = UsageData()
-        // Detach old navigator callbacks before replacing
-        navigator.onContent = nil
-        navigator.onLoginNeeded = nil
+        // Destroy old navigator to prevent memory leaks and crashes
+        navigator.destroy()
         updateWidgetHTML()
         WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.isLoggingOut = false
                 self.navigator = PageNavigator()
                 self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
                 self.openLoginWindow()
@@ -312,7 +328,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // ── Login Window ────────────────────────────────────────────────────
     func openLoginWindow() {
-        if let w = loginWindow { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        guard !isLoggingOut else { return }
+        if let w = loginWindow {
+            if navigator.webView.superview != w.contentView {
+                w.contentView?.subviews.forEach { $0.removeFromSuperview() }
+                navigator.webView.frame = w.contentView?.bounds ?? .zero
+                navigator.webView.autoresizingMask = [.width, .height]
+                w.contentView?.addSubview(navigator.webView)
+            }
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
             styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         win.title = "Claude Login"; win.center()
@@ -338,59 +365,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startLoginPoll() {
         loginPollTimer?.invalidate()
-        let probeConfig = WKWebViewConfiguration()
-        probeConfig.websiteDataStore = .default()
-        let probe = WKWebView(frame: .zero, configuration: probeConfig)
-        probe.customUserAgent = USER_AGENT
-
-        var probing = false
-        loginPollTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
-            guard let self = self, self.loginWindow != nil, !probing else {
-                if self?.loginWindow == nil { timer.invalidate() }
+        loginPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self = self, self.loginWindow != nil else {
+                timer.invalidate()
                 return
             }
-            probing = true
-            let probeURL = ORG_ID.isEmpty ? "\(CLAUDE_URL)/api/organizations" : USAGE_URL
-            guard let url = URL(string: probeURL) else { probing = false; return }
-            probe.load(URLRequest(url: url))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                guard let self = self else { probing = false; return }
-                probe.evaluateJavaScript("document.body.innerText") { [weak self] result, _ in
-                    probing = false
-                    guard let self = self else { return }
-                    let text = result as? String ?? ""
+            if let urlStr = self.navigator.webView.url?.absoluteString {
+                // If the URL has navigated away from the login page to the main app, login is complete
+                if urlStr.starts(with: CLAUDE_URL) && !urlStr.contains("/login") && !urlStr.contains("authorize") {
+                    timer.invalidate()
+                    self.loginPollTimer = nil
                     
-                    if ORG_ID.isEmpty {
-                        if text.contains("uuid") {
-                            self.loginPollTimer?.invalidate()
-                            self.loginPollTimer = nil
-                            self.closeLoginWindow()
-                            self.navigator.onContent = nil
-                            self.navigator.onLoginNeeded = nil
-                            self.navigator = PageNavigator()
-                            self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
-                            self.fetchAll()
-                        }
-                    } else {
-                        guard text.contains("utilization") else { return }
-                        self.loginPollTimer?.invalidate()
-                        self.loginPollTimer = nil
+                    // Give it a brief moment to ensure cookies are fully written to the data store
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        guard let self = self else { return }
                         self.closeLoginWindow()
-                        self.navigator.onContent = nil
-                        self.navigator.onLoginNeeded = nil
+                        self.navigator.destroy()
                         self.navigator = PageNavigator()
                         self.navigator.onLoginNeeded = { [weak self] in self?.openLoginWindow() }
-                        self.isLoggedIn = true
-                        self.parseUsageJSON(text)
-                        self.updateWidgetHTML()
-                        self.startRefreshTimer()
-                        self.fetchCcusage()
+                        self.fetchAll()
                     }
                 }
             }
         }
     }
-
     // ── ccusage ─────────────────────────────────────────────────────────
     private func fetchCcusage() {
         DispatchQueue.global(qos: .background).async { [weak self] in
